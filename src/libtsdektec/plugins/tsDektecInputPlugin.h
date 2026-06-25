@@ -13,6 +13,7 @@
 
 #pragma once
 #include "tsInputPlugin.h"
+#include "tsSignalState.h"
 
 namespace ts {
     //!
@@ -49,5 +50,16 @@ namespace ts {
 
         // Configure the LNB. Return true on success.
         bool configureLNB();
+
+        // Initialize the list of signal statistics which are supported by the input channel.
+        void initStatusReporting();
+
+        // Get the state of the input signal from the device statistics. Optionally add
+        // device-specific statistics into a JSON object. Return false if no statistics
+        // could be polled on this device.
+        bool getSignalState(SignalState& state, json::Object* obj = nullptr);
+
+        // Produce a JSON status report if necessary.
+        void jsonReport();
     };
 }

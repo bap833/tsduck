@@ -12,6 +12,12 @@
 #include "tsDektecDevice.h"
 #include "tsModulation.h"
 #include "tsLNB.h"
+#include "tsSignalState.h"
+#include "tsjsonOutputArgs.h"
+#include "tsjsonObject.h"
+#include "tsjson.h"
+#include "tsTime.h"
+#include "tsxmlAttribute.h"
 
 // Consider that the first 5 receive() are "initialization". If a full input FIFO is
 // observed here, ignore it. Later, a full FIFO indicates a potential packet loss.
@@ -50,6 +56,13 @@ public:
     Polarization        polarity = POL_VERTICAL;  // Polarity.
     bool                high_band = false;     // Use LNB high frequency band.
     bool                lnb_setup = false;     // Need LNB setup.
+    json::OutputArgs    json_args {};          // JSON status reporting options.
+    cn::seconds         json_interval {};      // Interval between JSON status reports.
+    Time                next_report {};        // UTC time of next JSON status report.
+    std::vector<Dtapi::DtStatistic> stats {};  // Signal statistics to poll for status reports.
+    std::optional<bool> last_lock {};          // Last known signal lock state.
+
+    static constexpr cn::seconds DEFAULT_JSON_INTERVAL = cn::seconds(60);
 };
 
 
@@ -85,6 +98,7 @@ ts::DektecInputPlugin::DektecInputPlugin(TSP* tsp_) :
     // Declaration of command-line options
     DefineDektecIOStandardArgs(*this);
     DefineDektecIPArgs(*this, true); // true = receive
+    _guts->json_args.defineArgs(*this, true, u"Produce a status report in JSON format at regular intervals.", false);
 
     option(u"c2-bandwidth", 0, Names({
         {u"6-MHz",  DTAPI_DVBC2_6MHZ},
@@ -207,6 +221,11 @@ ts::DektecInputPlugin::DektecInputPlugin(TSP* tsp_) :
     help(u"j83",
          u"QAM demodulators: indicate the ITU-T J.83 annex to use. "
          u"A is DVB-C, B is American QAM, C is Japanese QAM. The default is A.");
+
+    option<cn::seconds>(u"json-interval");
+    help(u"json-interval",
+         u"With --json-line, --json-tcp, --json-udp, specify the interval between two status reports. "
+         u"The default is " + UString::Chrono(Guts::DEFAULT_JSON_INTERVAL) + u".");
 
     option(u"lnb", 0, STRING);
     help(u"lnb",
@@ -355,7 +374,9 @@ bool ts::DektecInputPlugin::getOptions()
     _guts->lnb_setup = false;
 
     bool success = GetDektecIOStandardArgs(*this, _guts->iostd_value, _guts->iostd_subvalue) &&
-                   GetDektecIPArgs(*this, true, _guts->ip_pars);
+                   GetDektecIPArgs(*this, true, _guts->ip_pars) &&
+                   _guts->json_args.loadArgs(*this);
+    getChronoValue(_guts->json_interval, u"json-interval", Guts::DEFAULT_JSON_INTERVAL);
 
     // Compute carrier frequency
     if (present(u"frequency") && present(u"satellite-frequency")) {
@@ -717,6 +738,19 @@ bool ts::DektecInputPlugin::start()
     // Count number of receive() operations in "initialization" phase.
     _guts->init_cnt = INIT_RECEIVE_COUNT;
     _guts->is_started = true;
+
+    // Initialize the signal statistics which are available on this device.
+    initStatusReporting();
+
+    // Display signal state in verbose mode.
+    SignalState state;
+    if (getSignalState(state)) {
+        verbose(state.toString());
+    }
+
+    // Produce an initial JSON report if necessary.
+    jsonReport();
+
     return true;
 }
 
@@ -945,10 +979,320 @@ size_t ts::DektecInputPlugin::receive(TSPacket* buffer, TSPacketMetadata* pkt_da
     }
 
     if (status == DTAPI_OK) {
+        // Produce a periodic JSON status report if necessary.
+        jsonReport();
         return size / PKT_SIZE;
     }
     else {
         error(u"capture error on Dektec device %d: %s", _guts->dev_index, DektecStrError(status));
         return 0;
+    }
+}
+
+
+//----------------------------------------------------------------------------
+// Decoding of Dektec signal statistics.
+//----------------------------------------------------------------------------
+
+namespace {
+
+    // Convert a Dektec dB statistic into milli-dB. Integer statistics are
+    // expressed in units of 0.1 dB(m), floating-point ones in dB.
+    std::optional<int64_t> ToMilliDB(Dtapi::DtStatistic& stat)
+    {
+        double dval = 0.0;
+        int ival = 0;
+        if (stat.m_ValueType == Dtapi::DtStatistic::STAT_VT_DOUBLE && stat.GetValue(dval) == DTAPI_OK) {
+            return int64_t(std::lround(dval * 1000.0));
+        }
+        else if (stat.m_ValueType == Dtapi::DtStatistic::STAT_VT_INT && stat.GetValue(ival) == DTAPI_OK) {
+            return int64_t(ival) * 100;
+        }
+        else {
+            return std::nullopt;
+        }
+    }
+
+    // Is this statistic a bit error rate measured at some FEC-decoding stage? The
+    // consolidated dvb-compatible "ber" field is the maximum among those which currently
+    // return a value; the individual per-stage rates are forwarded raw.
+    bool IsBerStatId(int stat_id)
+    {
+        switch (stat_id) {
+            case DTAPI_STAT_BER_PREVIT:
+            case DTAPI_STAT_BER_PRELDPC:
+            case DTAPI_STAT_BER_PREBCH:
+            case DTAPI_STAT_BER_PRERS:
+            case DTAPI_STAT_BER_POSTVIT:
+            case DTAPI_STAT_BER_POSTLDPC:
+            case DTAPI_STAT_BER_POSTBCH:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Convert a Dektec statistic name into a JSON-friendly key: lower-case, with every run
+    // of non-alphanumeric characters replaced by a single '-', and no leading or trailing
+    // '-'. Example: "Packet error rate" -> "packet-error-rate".
+    ts::UString NormalizeStatKey(const ts::UString& name)
+    {
+        ts::UString key;
+        bool sep = false;
+        for (ts::UChar c : name) {
+            if (ts::IsAlphaNum(c)) {
+                if (sep && !key.empty()) {
+                    key.push_back(u'-');
+                }
+                sep = false;
+                key.push_back(ts::ToLower(c));
+            }
+            else {
+                sep = true;
+            }
+        }
+        return key;
+    }
+}
+
+
+//----------------------------------------------------------------------------
+// Initialize the list of signal statistics which are supported by the input channel.
+//----------------------------------------------------------------------------
+
+void ts::DektecInputPlugin::initStatusReporting()
+{
+    _guts->stats.clear();
+    _guts->last_lock.reset();
+    _guts->next_report = Time::CurrentUTC();
+
+    // Get the list of statistics which are supported by the input channel.
+    // Note: DtInpChannel::GetSupportedStatistics() does not accept a NULL array to
+    // probe for the count (it returns DTAPI_E_INVALID_ARG). Pass a real buffer, large
+    // enough to hold every statistic id; if it were ever too small, DTAPI reports the
+    // required size in 'count' together with DTAPI_E_BUF_TOO_SMALL.
+    std::vector<Dtapi::DtStatistic> supported(64);
+    int count = int(supported.size());
+    Dtapi::DTAPI_RESULT status = _guts->chan.GetSupportedStatistics(count, supported.data());
+    if (status == DTAPI_E_BUF_TOO_SMALL && count > int(supported.size())) {
+        supported.resize(size_t(count));
+        count = int(supported.size());
+        status = _guts->chan.GetSupportedStatistics(count, supported.data());
+    }
+    if (status == DTAPI_OK && count >= 0 && size_t(count) <= supported.size()) {
+        supported.resize(size_t(count));
+    }
+    else {
+        // Statistics are probably not supported on this device, this is not an error.
+        debug(u"error getting supported statistics: %s", DektecStrError(status));
+        supported.clear();
+    }
+    if (debug()) {
+        for (auto& stat : supported) {
+            const char* name = nullptr;
+            const char* short_name = nullptr;
+            if (stat.GetName(name, short_name) == DTAPI_OK && name != nullptr) {
+                debug(u"supported statistic 0x%X: %s", stat.m_StatisticId, UString::FromUTF8(name));
+            }
+            else {
+                debug(u"supported statistic 0x%X", stat.m_StatisticId);
+            }
+        }
+    }
+
+    // Poll every statistic supported by the channel. getSignalState() forwards each scalar
+    // one into the "raw-statistics" JSON object; a few are additionally mapped onto the
+    // normalized SignalState fields (lock, RF level, SNR, packet error rate, BER) for
+    // dvb-plugin compatibility. Statistics with no scalar value (structured types) are
+    // harmlessly polled and skipped at emission time.
+    for (const auto& stat : supported) {
+        _guts->stats.push_back(Dtapi::DtStatistic(stat.m_StatisticId));
+    }
+}
+
+
+//----------------------------------------------------------------------------
+// Get the state of the input signal from the device statistics.
+//----------------------------------------------------------------------------
+
+bool ts::DektecInputPlugin::getSignalState(SignalState& state, json::Object* obj)
+{
+    state.clear();
+    if (_guts->stats.empty()) {
+        return false;
+    }
+
+    // Poll all selected statistics in one call.
+    Dtapi::DTAPI_RESULT status = _guts->chan.GetStatistics(int(_guts->stats.size()), _guts->stats.data());
+    if (status != DTAPI_OK) {
+        debug(u"error getting signal statistics: %s", DektecStrError(status));
+        return false;
+    }
+
+    // Accumulators filled during the poll loop. 'locked' drives the lock-transition log;
+    // 'ber_max' is the maximum BER across the FEC stages that currently report one, which
+    // feeds the consolidated dvb-compatible "ber" field (see after the loop).
+    std::optional<bool> locked;
+    std::optional<double> ber_max;
+
+    // "raw-statistics" collects every scalar statistic, forwarded as-is (native value, no
+    // unit formatting) under a normalized key. Built for JSON output only.
+    json::ValuePtr raw;
+    if (obj != nullptr) {
+        raw = json::Factory(json::Type::Object);
+    }
+
+    for (auto& stat : _guts->stats) {
+        if (stat.m_Result != DTAPI_OK) {
+            continue; // this statistic is currently unavailable
+        }
+        const int stat_id = stat.m_StatisticId;
+
+        // A few statistics are mapped onto the normalized SignalState fields, for
+        // compatibility with the dvb plugin's status output. These are also computed when
+        // obj is null (the verbose signal-state summary produced at start()). They do not
+        // "continue": every statistic, including these, is additionally forwarded raw below
+        // for completeness and full precision.
+        if (stat_id == DTAPI_STAT_LOCK) {
+            bool bval = false;
+            if (stat.GetValue(bval) == DTAPI_OK) {
+                locked = bval;
+                state.signal_locked = bval;
+            }
+        }
+        else if (stat_id == DTAPI_STAT_RFLVL_CHAN) {
+            const std::optional<int64_t> mdb = ToMilliDB(stat);
+            if (mdb.has_value()) {
+                state.signal_strength = SignalState::Value(mdb.value(), SignalState::Unit::MDB);
+            }
+        }
+        else if (stat_id == DTAPI_STAT_SNR) {
+            const std::optional<int64_t> mdb = ToMilliDB(stat);
+            if (mdb.has_value()) {
+                state.signal_noise_ratio = SignalState::Value(mdb.value(), SignalState::Unit::MDB);
+            }
+        }
+        else if (stat_id == DTAPI_STAT_PER) {
+            // DTAPI reports PER as a fraction (0.0 to 1.0). Store it as a percentage, like
+            // the dvb plugin (SignalState::setPercent / Unit::PERCENT), so the "per" field
+            // uses the same key and "X%" format across both plugins.
+            double dval = 0.0;
+            if (stat.GetValue(dval) == DTAPI_OK) {
+                state.packet_error_rate = SignalState::Value(int64_t(dval * 100.0), SignalState::Unit::PERCENT);
+            }
+        }
+        else if (IsBerStatId(stat_id)) {
+            // Track the worst (maximum) BER across all FEC stages for the consolidated "ber".
+            double dval = 0.0;
+            if (stat.GetValue(dval) == DTAPI_OK && (!ber_max.has_value() || dval > ber_max.value())) {
+                ber_max = dval;
+            }
+        }
+
+        // Forward every scalar statistic raw, one JSON field each, under "raw-statistics".
+        if (raw == nullptr) {
+            continue; // not JSON output
+        }
+
+        // Determine the normalized JSON key from the DTAPI statistic name.
+        const char* name = nullptr;
+        const char* short_name = nullptr;
+        UString key;
+        if (stat.GetName(name, short_name) == DTAPI_OK) {
+            key = NormalizeStatKey(UString::FromUTF8(short_name != nullptr ? short_name : (name != nullptr ? name : "")));
+        }
+        if (key.empty()) {
+            continue;
+        }
+
+        // Forward the value according to its native type. Structured (non-scalar) statistics
+        // have no JSON scalar value and are skipped.
+        switch (stat.m_ValueType) {
+            case Dtapi::DtStatistic::STAT_VT_BOOL: {
+                bool bval = false;
+                if (stat.GetValue(bval) == DTAPI_OK) {
+                    raw->add(key, json::Bool(bval));
+                }
+                break;
+            }
+            case Dtapi::DtStatistic::STAT_VT_INT: {
+                int ival = 0;
+                if (stat.GetValue(ival) == DTAPI_OK) {
+                    raw->add(key, ival);
+                }
+                break;
+            }
+            case Dtapi::DtStatistic::STAT_VT_DOUBLE: {
+                double dval = 0.0;
+                if (stat.GetValue(dval) == DTAPI_OK) {
+                    raw->add(key, dval);
+                }
+                break;
+            }
+            default: {
+                break; // structured (non-scalar) statistic, cannot be a JSON scalar
+            }
+        }
+    }
+
+    // Consolidated dvb-compatible "ber": the maximum bit error rate among the FEC stages
+    // that currently report one, stored as a percentage exactly like the dvb plugin
+    // (Unit::PERCENT, "X%" format). Coarse by design (a small BER such as 5.49e-5 renders
+    // as "0%"); the precise per-stage rates are available under "raw-statistics".
+    if (ber_max.has_value()) {
+        state.bit_error_rate = SignalState::Value(int64_t(ber_max.value() * 100.0), SignalState::Unit::PERCENT);
+    }
+
+    // Attach the collected raw statistics, if any.
+    if (raw != nullptr && raw->size() > 0) {
+        obj->add(u"raw-statistics", raw);
+    }
+
+    // Log signal lock transitions.
+    if (locked.has_value()) {
+        if (_guts->last_lock.has_value() && locked.value() != _guts->last_lock.value()) {
+            if (locked.value()) {
+                info(u"input signal lock regained");
+            }
+            else {
+                warning(u"input signal lock lost");
+            }
+        }
+        _guts->last_lock = locked;
+    }
+
+    return true;
+}
+
+
+//----------------------------------------------------------------------------
+// Produce a JSON status report if necessary.
+//----------------------------------------------------------------------------
+
+void ts::DektecInputPlugin::jsonReport()
+{
+    if (_guts->json_args.useJSON() && Time::CurrentUTC() >= _guts->next_report) {
+
+        // Schedule next report.
+        _guts->next_report += _guts->json_interval;
+
+        // Build current report.
+        json::Object obj;
+        obj.add(u"#name", u"dektecstatus");
+        obj.add(u"time", xml::Attribute::DateTimeToString(Time::CurrentLocalTime()));
+        obj.add(u"packet-index", int64_t(tsp->pluginPackets()));
+        if (_guts->got_bitrate && _guts->cur_bitrate > 0) {
+            obj.add(u"bitrate", _guts->cur_bitrate.toString());
+        }
+        if (_guts->demod_freq > 0) {
+            obj.add(u"frequency", _guts->demod_freq);
+        }
+        SignalState state;
+        if (getSignalState(state, &obj)) {
+            state.toJSON(obj);
+        }
+
+        // Send the report to whatever was specified in the command line options.
+        _guts->json_args.report(obj, *this);
     }
 }

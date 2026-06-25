@@ -393,4 +393,26 @@ TS-over-IP: Optional VLAN identifier as specified in IEEE 802.1Q.
 [.optdoc]
 With SMPTE 2022-7 network redundancy, this parameter can be specified twice, main and redundant link.
 
+[.usage]
+Status reporting options
+
+Using these options, it is possible to send a status report of the reception at regular interval.
+The status report is in JSON format and can be displayed or sent over UDP or TCP.
+With demodulator devices, the report includes the state of the input signal
+(lock, strength, signal/noise ratio, bit error rate), as supported by the device.
+Every statistic the device exposes is reported as its own JSON field (carrier and FEC
+lock, CNR, MER, Es/N0, Eb/N0, link margin, per-stage BER/FER, etc.);
+the `signal-locked`, `strength`, `snr` and `per` fields use the same names and formats as the `dvb` plugin.
+
+[.opt]
+*--json-interval* _seconds_
+
+[.optdoc]
+With `--json-line`, `--json-tcp`, `--json-udp`, specify the interval between two status reports.
+
+[.optdoc]
+The default is 60 seconds.
+
+include::{docdir}/opt/group-json-output.adoc[tags=!*;notitle]
+
 include::{docdir}/opt/group-common-inputs.adoc[tags=!*]
