@@ -13,6 +13,8 @@
 
 #pragma once
 #include "tsInputPlugin.h"
+#include "tsSignalState.h"
+#include "tsjsonOutputArgs.h"
 
 namespace ts {
     //!
@@ -40,6 +42,7 @@ namespace ts {
     private:
         class Guts;
         Guts* _guts = nullptr;
+        json::OutputArgs _json_args {this};  // JSON status reporting options.
 
         // Start error: log error, detach channel & device, return false.
         bool startError(const UString&, unsigned int); // Dtapi::DTAPI_RESULT
@@ -49,5 +52,16 @@ namespace ts {
 
         // Configure the LNB. Return true on success.
         bool configureLNB();
+
+        // Initialize the list of signal statistics which are supported by the input channel.
+        void initStatusReporting();
+
+        // Get the state of the input signal from the device statistics. Optionally add
+        // device-specific statistics into a JSON object. Return false if no statistics
+        // could be polled on this device.
+        bool getSignalState(SignalState& state, json::Object* obj = nullptr);
+
+        // Produce a JSON status report if necessary.
+        void jsonReport();
     };
 }
